@@ -1,62 +1,75 @@
-from playwright.sync_api import sync_playwright
-import re
-import datetime
+from __future__ import annotations
+
+import csv
+import datetime as dt
 import os
-import pytz
-import logging
+import re
+from pathlib import Path
+from urllib.parse import quote_plus
 
-# Determine the base path relative to the script's location
-base_path = os.path.dirname(os.path.abspath(__file__))
+from playwright.sync_api import sync_playwright
 
-# Define the path to the 'data' directory
-extracted_folder_path = os.path.join(base_path, '..', 'data/extracted_id')
+DEFAULT_LOCATION = "kansas-city"
+DEFAULT_QUERY = "car or truck"
+SAFE_LOCATION = re.compile(r"^[a-z0-9-]+$")
+ITEM_PATTERN = re.compile(r"/marketplace/item/(\d+)")
 
-def run(playwright):
-    chromium = playwright.chromium
-    # Set up the proxy with authentication using the specified details
-    browser = chromium.launch(headless=True, proxy={
-        "server": "http://ultra.marsproxies.com:44443",  # Proxy server URL and port
-        "username": os.environ['FB_EMAIL'],                       # Proxy username
-        "password": os.environ['FB_PASSWORD']            # Proxy password
-    })
 
-    # Open a new page
-    page = browser.new_page()
-    try:
-        # Navigate to a test website to confirm proxy is functioning
-        page.goto('https://www.facebook.com/marketplace/melbourne/search?daysSinceListed=1&query=grange', timeout=30000)
-        # Optionally, take a screenshot for verification
-        page.screenshot(path="ip_address.png")
+def search_url(location: str, query: str) -> str:
+    if not SAFE_LOCATION.fullmatch(location):
+        raise ValueError("MARKETPLACE_LOCATION must use lowercase letters, numbers, and hyphens only")
+    if not query.strip() or len(query) > 100:
+        raise ValueError("MARKETPLACE_QUERY must be between 1 and 100 characters")
+    return (
+        f"https://www.facebook.com/marketplace/{location}/search"
+        f"?daysSinceListed=1&query={quote_plus(query.strip())}"
+    )
 
-        # Regular expression to match the desired URL pattern
-        url_pattern = re.compile(r'/marketplace/item/(\d+)')
-    
-        # Use Playwright to evaluate JavaScript in the context of the page to get all 'a' tags
-        a_tags = page.query_selector_all('a')
-        
-        # Initialize an empty list to store the matches
-        matched_ids = []
-    
-        # Loop through the 'a' tags and extract the href attribute
-        for tag in a_tags:
-            href = tag.get_attribute('href')
-            match = url_pattern.search(href)
-            if match:
-                matched_ids.append(match.group(1))
-                logging.info("match id: %s", match)
-    
-        # If there are matched IDs, write them to a CSV file
-        logging.info("matched_ids: %s", matched_ids)
-        if matched_ids:
-            tz_aet = pytz.timezone('Australia/Sydney')
-            now = datetime.datetime.now(tz_aet)  # Ensure 'now' is defined and captures the current time
-            formatted_date = now.strftime("%Y-%m-%d-%H-%M-%S")
-            file_name = os.path.join(extracted_folder_path, f"{formatted_date}_extracted_ids.csv")
-            with open(file_name, 'w') as csvfile:  # Using 'w' to overwrite any existing file or 'a' to append if that's the intention
-                for id in matched_ids:
-                    csvfile.write(id + '\n')
-    
-    finally:
-        # Ensure the browser is closed after the operation
-        browser.close()
 
+def run() -> Path:
+    location = os.getenv("MARKETPLACE_LOCATION", DEFAULT_LOCATION).strip()
+    query = os.getenv("MARKETPLACE_QUERY", DEFAULT_QUERY).strip()
+    output_dir = Path(__file__).resolve().parent.parent / "data" / "extracted_id"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(locale="en-US")
+        try:
+            url = search_url(location, query)
+            print(f"Searching {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(5_000)
+
+            item_ids: set[str] = set()
+            for tag in page.query_selector_all('a[href*="/marketplace/item/"]'):
+                href = tag.get_attribute("href")
+                if not href:
+                    continue
+                match = ITEM_PATTERN.search(href)
+                if match:
+                    item_ids.add(match.group(1))
+
+            timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d-%H-%M-%S")
+            output_file = output_dir / f"{timestamp}_extracted_ids.csv"
+            with output_file.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["item_id", "item_url", "location", "query"])
+                for item_id in sorted(item_ids):
+                    writer.writerow([
+                        item_id,
+                        f"https://www.facebook.com/marketplace/item/{item_id}",
+                        location,
+                        query,
+                    ])
+
+            page.screenshot(path=str(output_dir / f"{timestamp}_search.png"), full_page=True)
+            print(f"Found {len(item_ids)} unique listings")
+            print(f"Saved results to {output_file}")
+            return output_file
+        finally:
+            browser.close()
+
+
+if __name__ == "__main__":
+    run()
